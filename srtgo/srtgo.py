@@ -128,9 +128,18 @@ RailType = Union[str, None]
 ChoiceType = Union[int, None]
 
 
-@click.command()
+@click.group(invoke_without_command=True)
 @click.option("--debug", is_flag=True, help="Debug mode")
-def srtgo(debug=False):
+@click.pass_context
+def srtgo(ctx, debug=False):
+    ctx.ensure_object(dict)
+    ctx.obj["debug"] = debug
+    if ctx.invoked_subcommand is not None:
+        return
+    _interactive_menu(debug)
+
+
+def _interactive_menu(debug=False):
     MENU_CHOICES = [
         ("예매 시작", 1),
         ("예매 확인/결제/취소", 2),
@@ -181,6 +190,244 @@ def srtgo(debug=False):
         action = ACTIONS.get(choice)
         if action:
             action(rail_type)
+
+
+SEAT_TYPE_MAP = {
+    "general_first": SeatType.GENERAL_FIRST,
+    "general_only": SeatType.GENERAL_ONLY,
+    "special_first": SeatType.SPECIAL_FIRST,
+    "special_only": SeatType.SPECIAL_ONLY,
+}
+
+
+def _normalize_time(time_str: str) -> str:
+    """Normalize time input: accept HH or HHMMSS format."""
+    time_str = time_str.strip()
+    if len(time_str) <= 2:
+        return f"{int(time_str):02d}0000"
+    return time_str.ljust(6, "0")
+
+
+@srtgo.command()
+@click.option("--dep", required=True, help="출발역 (e.g., 수서)")
+@click.option("--arr", required=True, help="도착역 (e.g., 부산)")
+@click.option("--date", required=True, help="날짜 YYYYMMDD (e.g., 20260315)")
+@click.option("--time", "time_", required=True, help="시각 HH or HHMMSS (e.g., 12 or 120000)")
+@click.option("--debug", is_flag=True, help="Debug mode")
+def search(dep, arr, date, time_, debug):
+    """Search for available SRT trains (non-interactive)."""
+    rail_type = "SRT"
+    time_val = _normalize_time(time_)
+
+    try:
+        rail = login(rail_type, debug=debug)
+    except Exception as e:
+        print(f"로그인 실패: {e}")
+        return
+
+    try:
+        trains = rail.search_train(
+            dep=dep, arr=arr, date=date, time=time_val,
+            passengers=[Adult(1)], available_only=False,
+        )
+    except Exception as e:
+        print(f"열차 조회 실패: {e}")
+        return
+
+    if not trains:
+        print("조회된 열차가 없습니다.")
+        return
+
+    print(f"\n{'='*80}")
+    print(f"  SRT 열차 조회: {dep} → {arr} ({date[:4]}/{date[4:6]}/{date[6:8]}, {time_val[:2]}시 이후)")
+    print(f"{'='*80}")
+    for i, train in enumerate(trains):
+        print(f"[{i}] {train}")
+    print(f"{'='*80}\n")
+
+
+@srtgo.command()
+@click.option("--dep", required=True, help="출발역 (e.g., 수서)")
+@click.option("--arr", required=True, help="도착역 (e.g., 부산)")
+@click.option("--date", required=True, help="날짜 YYYYMMDD (e.g., 20260315)")
+@click.option("--time", "time_", required=True, help="시각 HH or HHMMSS (e.g., 12 or 120000)")
+@click.option("--trains", required=True, help="예약할 열차 인덱스 (comma-separated, e.g., 0,1,2)")
+@click.option("--adult", default=1, help="성인 승객수 (default: 1)")
+@click.option("--child", default=0, help="어린이 승객수")
+@click.option("--senior", default=0, help="경로우대 승객수")
+@click.option("--disability1to3", default=0, help="중증장애인 승객수")
+@click.option("--disability4to6", default=0, help="경증장애인 승객수")
+@click.option("--seat-type", "seat_type", default="general_first",
+              type=click.Choice(["general_first", "general_only", "special_first", "special_only"]),
+              help="좌석 유형 (default: general_first)")
+@click.option("--pay", required=True, type=click.Choice(["yes", "no"]), help="카드 자동결제 여부 (yes/no)")
+@click.option("--debug", is_flag=True, help="Debug mode")
+def book(dep, arr, date, time_, trains, adult, child, senior, disability1to3, disability4to6, seat_type, pay, debug):
+    """Book SRT trains (non-interactive booking loop)."""
+    rail_type = "SRT"
+    time_val = _normalize_time(time_)
+    auto_pay = pay == "yes"
+    seat_option = SEAT_TYPE_MAP[seat_type]
+
+    # Parse train indices
+    try:
+        train_indices = [int(x.strip()) for x in trains.split(",")]
+    except ValueError:
+        print("열차 인덱스는 숫자를 쉼표로 구분해주세요 (e.g., 0,1,2)")
+        return
+
+    # Build passenger list
+    passenger_classes = {
+        "adult": Adult,
+        "child": Child,
+        "senior": Senior,
+        "disability1to3": Disability1To3,
+        "disability4to6": Disability4To6,
+    }
+    passenger_counts = {
+        "adult": adult, "child": child, "senior": senior,
+        "disability1to3": disability1to3, "disability4to6": disability4to6,
+    }
+
+    passengers = []
+    total_count = 0
+    for key, cls in passenger_classes.items():
+        count = passenger_counts[key]
+        if count > 0:
+            passengers.append(cls(count))
+            total_count += count
+
+    if not passengers:
+        print(colored("승객수는 0이 될 수 없습니다", "green", "on_red"))
+        return
+
+    if total_count >= 10:
+        print(colored("승객수는 10명을 초과할 수 없습니다", "green", "on_red"))
+        return
+
+    # Login
+    try:
+        rail = login(rail_type, debug=debug)
+    except Exception as e:
+        print(f"로그인 실패: {e}")
+        return
+
+    # Search params (for the retry loop)
+    search_params = {
+        "dep": dep, "arr": arr, "date": date, "time": time_val,
+        "passengers": [Adult(total_count)], "available_only": False,
+    }
+
+    # Initial search to validate indices
+    try:
+        train_list = rail.search_train(**search_params)
+    except Exception as e:
+        print(f"열차 조회 실패: {e}")
+        return
+
+    if not train_list:
+        print("조회된 열차가 없습니다.")
+        return
+
+    for idx in train_indices:
+        if idx < 0 or idx >= len(train_list):
+            print(f"잘못된 열차 인덱스: {idx} (0~{len(train_list)-1} 사이)")
+            return
+
+    print(f"\n예매 대상 열차:")
+    for idx in train_indices:
+        print(f"  [{idx}] {train_list[idx]}")
+    print(f"승객: 성인 {adult}명" + (f", 어린이 {child}명" if child else "") +
+          (f", 경로 {senior}명" if senior else "") + f" | 좌석: {seat_type} | 결제: {'자동' if auto_pay else '수동'}")
+    print(f"예매 루프를 시작합니다...\n")
+
+    # Reserve function
+    def _do_reserve(train):
+        reservation = rail.reserve(train, passengers=passengers, option=seat_option)
+        msg = f"{reservation}"
+        if hasattr(reservation, "tickets") and reservation.tickets:
+            msg += "\n" + "\n".join(map(str, reservation.tickets))
+
+        print(colored(f"\n\n🎫 🎉 예매 성공!!! 🎉 🎫\n{msg}\n", "red", "on_green"))
+
+        if auto_pay and not reservation.is_waiting and pay_card(rail, reservation):
+            print(colored("\n\n💳 ✨ 결제 성공!!! ✨ 💳\n\n", "green", "on_red"), end="")
+            msg += "\n결제 완료"
+
+        tgprintf = get_telegram()
+        asyncio.run(tgprintf(msg))
+
+    # Booking loop (non-interactive: no prompts, just retry)
+    i_try = 0
+    start_time = time.time()
+    while True:
+        try:
+            i_try += 1
+            elapsed_time = time.time() - start_time
+            hours, remainder = divmod(int(elapsed_time), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            print(
+                f"\r예매 대기 중... {WAITING_BAR[i_try & 3]} {i_try:4d} ({hours:02d}:{minutes:02d}:{seconds:02d}) ",
+                end="", flush=True,
+            )
+
+            train_list = rail.search_train(**search_params)
+            for idx in train_indices:
+                if idx < len(train_list) and _is_seat_available(train_list[idx], seat_option, rail_type):
+                    _do_reserve(train_list[idx])
+                    return
+            _sleep()
+
+        except SRTError as ex:
+            msg = ex.msg
+            if "정상적인 경로로 접근 부탁드립니다" in msg or isinstance(ex, SRTNetFunnelError):
+                if debug:
+                    print(f"\nNetFunnel/경로 오류: {msg}")
+                rail.clear()
+            elif "로그인 후 사용하십시오" in msg:
+                if debug:
+                    print(f"\n재로그인 필요: {msg}")
+                try:
+                    rail = login(rail_type, debug=debug)
+                except Exception:
+                    print(f"\n재로그인 실패. 계속 재시도...")
+            elif not any(
+                err in msg for err in (
+                    "잔여석없음",
+                    "사용자가 많아 접속이 원활하지 않습니다",
+                    "예약대기 접수가 마감되었습니다",
+                    "예약대기자한도수초과",
+                )
+            ):
+                print(f"\nSRT 오류: {msg} — 계속 재시도...")
+            _sleep()
+
+        except JSONDecodeError as ex:
+            if debug:
+                print(f"\nJSON 파싱 오류: {ex}")
+            _sleep()
+            try:
+                rail = login(rail_type, debug=debug)
+            except Exception:
+                pass
+
+        except ConnectionError:
+            print("\n연결이 끊겼습니다. 재접속 시도...")
+            _sleep()
+            try:
+                rail = login(rail_type, debug=debug)
+            except Exception:
+                pass
+
+        except Exception as ex:
+            if debug:
+                print(f"\n예외 발생: {type(ex).__name__}: {ex}")
+            print(f"\n오류 발생, 계속 재시도...")
+            _sleep()
+            try:
+                rail = login(rail_type, debug=debug)
+            except Exception:
+                pass
 
 
 def set_station(rail_type: RailType) -> bool:
